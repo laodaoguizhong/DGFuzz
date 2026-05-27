@@ -11,11 +11,30 @@ except ImportError:
     torch = None
 logger = logging.getLogger(__name__)
 _EPS = 1e-08
-_DEFAULT_BANDWIDTH = 0.95
-_DEFAULT_TAU_R = 0.5
-_DEFAULT_PSI1 = 0.8
-_DEFAULT_PSI2 = 2.0
-_DEFAULT_COSINE_DIST = 0.15
+
+# DGFuzz method defaults (paper); override via fuzz.py CLI kwargs only.
+TAU_R = 0.1
+TOP_B_RATIO = 0.5
+PSI1 = 0.8
+PSI2 = 2.0
+TAU_H = 0.95
+DEFECT_SIGMA = 0.3
+BANDWIDTH_BY_DATASET = {'mnist': 0.3, 'cifar10': 0.5}
+COSINE_THRESHOLD_BY_DATASET = {'mnist': 0.1, 'cifar10': 0.15}
+
+
+def dgfuzz_defaults_for_dataset(dataset: str) -> Dict[str, float]:
+    ds = dataset.lower()
+    return {
+        'tau_r': TAU_R,
+        'top_b_ratio': TOP_B_RATIO,
+        'psi1': PSI1,
+        'psi2': PSI2,
+        'tau_h': TAU_H,
+        'sigma': DEFECT_SIGMA,
+        'bandwidth': BANDWIDTH_BY_DATASET.get(ds, BANDWIDTH_BY_DATASET['cifar10']),
+        'cosine_threshold': COSINE_THRESHOLD_BY_DATASET.get(ds, COSINE_THRESHOLD_BY_DATASET['cifar10']),
+    }
 
 @dataclass(order=True)
 class _PriorityItem:
@@ -39,7 +58,7 @@ class ClusterState:
 
 class UniqueDefectChecker:
 
-    def __init__(self, cosine_threshold: float=_DEFAULT_COSINE_DIST):
+    def __init__(self, cosine_threshold: float=COSINE_THRESHOLD_BY_DATASET['cifar10']):
         self.threshold = cosine_threshold
         self._store: Dict[Tuple[int, int], List[np.ndarray]] = defaultdict(list)
 
@@ -65,12 +84,12 @@ class UniqueDefectChecker:
     def total_unique(self) -> int:
         return sum((len(v) for v in self._store.values()))
 
-def _gaussian_kernel(x: np.ndarray, center: np.ndarray, bandwidth: float) -> float:
+def _gaussian_kernel(x: np.ndarray, center: np.ndarray, bandwidth: float=BANDWIDTH_BY_DATASET['cifar10']) -> float:
     diff = x.astype(np.float32).ravel() - center.astype(np.float32).ravel()
     sq_dist = float(np.dot(diff, diff))
     return float(np.exp(-sq_dist / (2.0 * bandwidth ** 2 + _EPS)))
 
-def compute_region_strength(feature_vec: np.ndarray, clusters: List[ClusterState], bandwidth: float=_DEFAULT_BANDWIDTH) -> Tuple[int, float]:
+def compute_region_strength(feature_vec: np.ndarray, clusters: List[ClusterState], bandwidth: float=BANDWIDTH_BY_DATASET['cifar10']) -> Tuple[int, float]:
     best_id = -1
     best_r = -1.0
     for cs in clusters:
@@ -82,7 +101,7 @@ def compute_region_strength(feature_vec: np.ndarray, clusters: List[ClusterState
 
 class SeedInitializer:
 
-    def __init__(self, clusters: List[ClusterState], bandwidth: float=_DEFAULT_BANDWIDTH, tau_r: float=_DEFAULT_TAU_R, top_b_ratio: float=0.5, enable_vrm: bool=True):
+    def __init__(self, clusters: List[ClusterState], bandwidth: float=BANDWIDTH_BY_DATASET['cifar10'], tau_r: float=TAU_R, top_b_ratio: float=TOP_B_RATIO, enable_vrm: bool=True):
         self.clusters = clusters
         self.bandwidth = bandwidth
         self.tau_r = tau_r
@@ -99,9 +118,9 @@ class SeedInitializer:
                 chunks.append(np.asarray(s, dtype=np.float32))
         return np.stack(chunks, axis=0)
 
-    def run(self, seeds: List[Any], feature_extractor, logits_arr: np.ndarray, true_labels: List[int], keep_count: Optional[int]=None, features_arr: Optional[np.ndarray]=None, feature_batch_size: int=32) -> List[Tuple[Any, int, float]]:
+    def run(self, seeds: List[Any], feature_extractor, logits_arr: np.ndarray, true_labels: List[int], keep_count: Optional[int]=None, features_arr: Optional[np.ndarray]=None, feature_batch_size: int=32) -> Tuple[List[Tuple[Any, int, float]], List[Tuple[Any, int, float]]]:
         if not seeds:
-            return []
+            return [], []
         logger.info('[SeedInit] Stage 1: computing boundary sensitivity ...')
         if features_arr is not None:
             features = np.asarray(features_arr, dtype=np.float32)
@@ -131,8 +150,8 @@ class SeedInitializer:
         if len(candidate_idx) == 0:
             logger.warning('[SeedInit] Stage 1: no candidates; relaxing threshold, keeping all samples.')
             candidate_idx = np.arange(n)
-        result: List[Tuple[Any, int, float]] = []
-        stage2_candidates: List[Tuple[Any, int, float]] = []
+        primary: List[Tuple[Any, int, float]] = []
+        fallback: List[Tuple[Any, int, float]] = []
         default_cluster_id = self.clusters[0].cluster_id if self.clusters else -1
         for idx in candidate_idx:
             fv = features[idx]
@@ -140,22 +159,18 @@ class SeedInitializer:
                 best_id, best_r = compute_region_strength(fv, self.clusters, self.bandwidth)
             else:
                 best_id, best_r = (default_cluster_id, 1.0)
-            stage2_candidates.append((seeds[idx], best_id, max(best_r, _EPS)))
+            best_r = max(best_r, _EPS)
+            item = (seeds[idx], best_id, best_r)
             if not self.enable_vrm or best_r >= self.tau_r:
-                result.append((seeds[idx], best_id, best_r))
-        logger.info('[SeedInit] Stage 2 filter: %d / %d passed (tau=%.4f)', len(result), len(candidate_idx), self.tau_r)
-        if keep_count is not None and keep_count > 0:
-            stage2_candidates.sort(key=lambda x: x[2], reverse=True)
-            by_seed_id = {}
-            for item in result:
-                by_seed_id[id(item[0])] = item
-            for item in stage2_candidates:
-                by_seed_id.setdefault(id(item[0]), item)
-            merged = list(by_seed_id.values())
-            merged.sort(key=lambda x: x[2], reverse=True)
-            result = merged[:keep_count]
-            logger.info('[SeedInit] Regular pool size cap: target=%d, kept=%d.', keep_count, len(result))
-        return result
+                primary.append(item)
+            else:
+                fallback.append(item)
+        logger.info('[SeedInit] Stage 2: Q=%d, Q_V=%d / %d (tau_R=%.4f)', len(primary), len(fallback), len(candidate_idx), self.tau_r)
+        if keep_count is not None and keep_count > 0 and len(primary) > keep_count:
+            primary.sort(key=lambda x: x[2], reverse=True)
+            primary = primary[:keep_count]
+            logger.info('[SeedInit] Regular pool size cap: kept Q=%d.', len(primary))
+        return primary, fallback
 
     @staticmethod
     def _compute_margins(logits: np.ndarray, true_labels: List[int]) -> np.ndarray:
@@ -195,10 +210,11 @@ class PrioritySeedQueue:
 
 class DGFuzzRuntimeCore:
 
-    def __init__(self, clusters: List[ClusterState], bandwidth: float=_DEFAULT_BANDWIDTH, tau_r: float=_DEFAULT_TAU_R, psi1: float=_DEFAULT_PSI1, psi2: float=_DEFAULT_PSI2, cosine_threshold: float=_DEFAULT_COSINE_DIST, top_b_ratio: float=0.5, enable_vrm: bool=True, enable_adaptive_schedule: bool=True):
+    def __init__(self, clusters: List[ClusterState], bandwidth: float=BANDWIDTH_BY_DATASET['cifar10'], tau_r: float=TAU_R, psi1: float=PSI1, psi2: float=PSI2, cosine_threshold: float=COSINE_THRESHOLD_BY_DATASET['cifar10'], top_b_ratio: float=TOP_B_RATIO, tau_h: float=TAU_H, enable_vrm: bool=True, enable_adaptive_schedule: bool=True):
         self.clusters = clusters
         self.bandwidth = bandwidth
         self.tau_r = tau_r
+        self.tau_h = tau_h
         self.psi1 = psi1
         self.psi2 = psi2
         self.top_b_ratio = top_b_ratio
@@ -219,6 +235,7 @@ class DGFuzzRuntimeCore:
         self._warmup_total: int = 0
         self._seed_bank: Dict[int, Any] = {}
         self._seed_priority: Dict[int, float] = {}
+        self._fallback_pool: List[Any] = []
 
     def _register_seed(self, seed: Any, priority: float) -> None:
         sid = id(seed)
@@ -227,16 +244,18 @@ class DGFuzzRuntimeCore:
 
     def initialize_seeds(self, seeds: List[Any], feature_extractor, logits_arr: np.ndarray, true_labels: List[int], keep_count: Optional[int]=None, features_arr: Optional[np.ndarray]=None, feature_batch_size: int=32) -> int:
         initializer = SeedInitializer(clusters=self.clusters, bandwidth=self.bandwidth, tau_r=self.tau_r, top_b_ratio=self.top_b_ratio, enable_vrm=self.enable_vrm)
-        filtered = initializer.run(seeds, feature_extractor, logits_arr, true_labels, keep_count=keep_count, features_arr=features_arr, feature_batch_size=feature_batch_size)
-        for seed, cluster_id, r_score in filtered:
+        primary, fallback = initializer.run(seeds, feature_extractor, logits_arr, true_labels, keep_count=keep_count, features_arr=features_arr, feature_batch_size=feature_batch_size)
+        for seed, cluster_id, r_score in primary:
             cs = self._cluster_map.get(cluster_id)
             p_k = cs.priority if cs else 0.0
             init_priority = self.psi1 + p_k * r_score
             self._register_seed(seed, init_priority)
             self._warmup_pool.append(seed)
+        for seed, _, _ in fallback:
+            self._fallback_pool.append(seed)
         self._warmup_total = len(self._warmup_pool) * 2
-        logger.info('[DGFuzzRuntime] Seed init done: %d seeds enqueued', len(filtered))
-        return len(filtered)
+        logger.info('[DGFuzzRuntime] Seed init done: Q=%d, Q_V=%d', len(primary), len(fallback))
+        return len(primary) + len(fallback)
 
     def append_direct_seeds(self, seeds: List[Any], features_arr: np.ndarray) -> int:
         features_arr = np.asarray(features_arr, dtype=np.float32)
@@ -248,11 +267,14 @@ class DGFuzzRuntimeCore:
         for idx, seed in enumerate(seeds):
             fv = features_arr[idx].astype(np.float32).ravel()
             best_id, best_r = self._region_assign(fv)
-            cs = self._cluster_map.get(best_id)
-            p_k = cs.priority if cs else 0.0
-            init_priority = self.psi1 + p_k * max(best_r, _EPS)
-            self._register_seed(seed, init_priority)
-            self._warmup_pool.append(seed)
+            if best_r >= self.tau_r:
+                cs = self._cluster_map.get(best_id)
+                p_k = cs.priority if cs else 0.0
+                init_priority = self.psi1 + p_k * max(best_r, _EPS)
+                self._register_seed(seed, init_priority)
+                self._warmup_pool.append(seed)
+            else:
+                self._fallback_pool.append(seed)
             added += 1
         self._warmup_total = len(self._warmup_pool) * 2
         logger.info('[DGFuzzRuntime] Direct seed append done: added %d seeds.', added)
@@ -274,6 +296,9 @@ class DGFuzzRuntimeCore:
             seed = self._warmup_pool[self._warmup_ptr % len(self._warmup_pool)]
             self._warmup_ptr += 1
             return seed
+        if self._should_use_fallback() and self._fallback_pool:
+            idx = int(np.random.randint(0, len(self._fallback_pool)))
+            return self._fallback_pool[idx]
         if self._seed_priority:
             best_sid = max(self._seed_priority, key=self._seed_priority.get)
             best_seed = self._seed_bank.pop(best_sid, None)
@@ -294,7 +319,7 @@ class DGFuzzRuntimeCore:
             return
         u_val = self._compute_ut(is_defect, is_unique)
         best_id, best_r = self._region_assign(feature_vec.astype(np.float32).ravel())
-        cs = self._cluster_map.get(best_id)
+        cs = self._cluster_map.get(best_id) if best_r >= self.tau_r else None
         priority = self._compute_priority(u_val, cs, best_r)
         if priority > 0:
             if u_val == 1:
@@ -324,12 +349,25 @@ class DGFuzzRuntimeCore:
         default_cluster_id = self.clusters[0].cluster_id if self.clusters else -1
         return (default_cluster_id, 1.0)
 
+    def _should_use_fallback(self) -> bool:
+        m = len(self.clusters)
+        if m <= 1:
+            return m == 0
+        weights = np.array([c.priority for c in self.clusters], dtype=np.float64)
+        s = weights.sum()
+        if s < _EPS:
+            return True
+        p = weights / s
+        entropy = float(-np.sum(p * np.log(p + _EPS)))
+        return entropy / np.log(m) >= self.tau_h
+
     def _compute_priority(self, u_val: int, cs: Optional[ClusterState], r_score: float) -> float:
-        if u_val == 2:
-            return self.psi2
-        if u_val == 1:
-            return self.psi1 + (cs.priority if cs is not None else 0.0) * r_score
-        return 0.0
+        if u_val == 0:
+            return 0.0
+        base = self.psi2 if u_val == 2 else self.psi1
+        if cs is not None and r_score >= self.tau_r:
+            return base + cs.priority * r_score
+        return base
 
     def _update_cluster_priority(self, cs: ClusterState) -> None:
         cs.priority = cs.defect_rate
@@ -345,7 +383,7 @@ class DGFuzzRuntimeCore:
         for c, p in zip(self.clusters, softmax_scores):
             c.priority = float(p)
 
-def build_runtime(adv_library_path: str, cluster_labels: np.ndarray, cluster_centers: Optional[np.ndarray]=None, bandwidth: float=_DEFAULT_BANDWIDTH, tau_r: float=_DEFAULT_TAU_R, psi1: float=_DEFAULT_PSI1, psi2: float=_DEFAULT_PSI2, cosine_threshold: float=_DEFAULT_COSINE_DIST, top_b_ratio: float=0.5, enable_vrm: bool=True, enable_adaptive_schedule: bool=True) -> DGFuzzRuntimeCore:
+def build_runtime(adv_library_path: str, cluster_labels: np.ndarray, cluster_centers: Optional[np.ndarray]=None, bandwidth: float=BANDWIDTH_BY_DATASET['cifar10'], tau_r: float=TAU_R, psi1: float=PSI1, psi2: float=PSI2, cosine_threshold: float=COSINE_THRESHOLD_BY_DATASET['cifar10'], top_b_ratio: float=TOP_B_RATIO, tau_h: float=TAU_H, enable_vrm: bool=True, enable_adaptive_schedule: bool=True) -> DGFuzzRuntimeCore:
     data = np.load(adv_library_path, allow_pickle=True)
     adv_features: np.ndarray = data['features']
     unique_cluster_ids = sorted(set(cluster_labels.tolist()) - {-1})
@@ -362,4 +400,4 @@ def build_runtime(adv_library_path: str, cluster_labels: np.ndarray, cluster_cen
             center = cluster_feats.mean(axis=0).astype(np.float32)
         clusters.append(ClusterState(cluster_id=k, center=center, size=size))
     logger.info('[DGFuzzRuntime] Loaded %d adversarial samples from %s; found %d vulnerability clusters.', len(adv_features), adv_library_path, len(clusters))
-    return DGFuzzRuntimeCore(clusters=clusters, bandwidth=bandwidth, tau_r=tau_r, psi1=psi1, psi2=psi2, cosine_threshold=cosine_threshold, top_b_ratio=top_b_ratio, enable_vrm=enable_vrm, enable_adaptive_schedule=enable_adaptive_schedule)
+    return DGFuzzRuntimeCore(clusters=clusters, bandwidth=bandwidth, tau_r=tau_r, psi1=psi1, psi2=psi2, cosine_threshold=cosine_threshold, top_b_ratio=top_b_ratio, tau_h=tau_h, enable_vrm=enable_vrm, enable_adaptive_schedule=enable_adaptive_schedule)
