@@ -6,13 +6,19 @@ from torchvision import transforms
 import cv2
 
 class MutationEngine:
-
-    def __init__(self, config):
-        self.config = config
+    ROTATION_RANGE = (-15, 15)
+    TRANSLATION_RANGE = (-4, 4)
+    SCALE_RANGE = (0.9, 1.1)
+    BRIGHTNESS_RANGE = (0.8, 1.2)
+    CONTRAST_RANGE = (0.8, 1.2)
+    GAUSSIAN_NOISE_RANGE = (0.01, 0.05)
+    GAUSSIAN_BLUR_SIGMA = (0.5, 1.5)
+    SEMANTIC_ALPHA = 0.02
+    SEMANTIC_BETA = 0.2
 
     def rotate(self, image, angle=None):
         if angle is None:
-            angle = random.uniform(*self.config.rotation_range)
+            angle = random.uniform(*self.ROTATION_RANGE)
         if isinstance(image, np.ndarray):
             h, w = image.shape[-2:]
             center = (w // 2, h // 2)
@@ -29,9 +35,9 @@ class MutationEngine:
 
     def translate(self, image, tx=None, ty=None):
         if tx is None:
-            tx = random.randint(*self.config.translation_range)
+            tx = random.randint(*self.TRANSLATION_RANGE)
         if ty is None:
-            ty = random.randint(*self.config.translation_range)
+            ty = random.randint(*self.TRANSLATION_RANGE)
         if isinstance(image, np.ndarray):
             h, w = image.shape[-2:]
             M = np.float32([[1, 0, tx], [0, 1, ty]])
@@ -47,7 +53,7 @@ class MutationEngine:
 
     def scale(self, image, scale_factor=None):
         if scale_factor is None:
-            scale_factor = random.uniform(*self.config.scale_range)
+            scale_factor = random.uniform(*self.SCALE_RANGE)
         if isinstance(image, np.ndarray):
             h, w = image.shape[-2:]
             new_h, new_w = (int(h * scale_factor), int(w * scale_factor))
@@ -79,27 +85,27 @@ class MutationEngine:
 
     def adjust_brightness(self, image, factor=None):
         if factor is None:
-            factor = random.uniform(*self.config.brightness_range)
+            factor = random.uniform(*self.BRIGHTNESS_RANGE)
         adjusted = image * factor
         return np.clip(adjusted, 0, 1)
 
     def adjust_contrast(self, image, factor=None):
         if factor is None:
-            factor = random.uniform(*self.config.contrast_range)
+            factor = random.uniform(*self.CONTRAST_RANGE)
         mean = np.mean(image)
         adjusted = (image - mean) * factor + mean
         return np.clip(adjusted, 0, 1)
 
     def add_gaussian_noise(self, image, sigma=None):
         if sigma is None:
-            sigma = random.uniform(*self.config.gaussian_noise_range)
+            sigma = random.uniform(*self.GAUSSIAN_NOISE_RANGE)
         noise = np.random.normal(0, sigma, image.shape)
         noisy = image + noise
         return np.clip(noisy, 0, 1)
 
     def gaussian_blur(self, image, sigma=None):
         if sigma is None:
-            sigma = random.uniform(*self.config.gaussian_blur_sigma)
+            sigma = random.uniform(*self.GAUSSIAN_BLUR_SIGMA)
         if len(image.shape) == 2:
             blurred = gaussian_filter(image, sigma=sigma)
         else:
@@ -123,7 +129,11 @@ class MutationEngine:
                 seed_indices.append(i)
         return (np.array(mutated_samples), np.array(seed_indices))
 
-    def check_semantic_preservation(self, original_img, mutated_img, alpha=0.02, beta=0.2):
+    def check_semantic_preservation(self, original_img, mutated_img, alpha=None, beta=None):
+        if alpha is None:
+            alpha = self.SEMANTIC_ALPHA
+        if beta is None:
+            beta = self.SEMANTIC_BETA
         if isinstance(original_img, torch.Tensor):
             original_img = original_img.cpu().numpy()
         if isinstance(mutated_img, torch.Tensor):
@@ -137,10 +147,9 @@ class MutationEngine:
 
 class ErrorPotentialEvaluator:
 
-    def __init__(self, model, config):
+    def __init__(self, model, device: str):
         self.model = model
-        self.config = config
-        self.device = config.device
+        self.device = device
         self.model.eval()
 
     def evaluate_error_potential(self, seeds, seed_labels, mutation_engine, num_mutations_per_seed):
