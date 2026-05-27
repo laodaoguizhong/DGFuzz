@@ -11,6 +11,7 @@ from tqdm import tqdm
 from utils.mutate import MutationEngine
 from utils.cluster import ClusteringAnalyzer
 from utils.strategy import FuzzerStrategy, DGFuzzStrategy
+from utils.runtime import DEFECT_SIGMA
 
 @dataclass
 class DGFuzzConfig:
@@ -20,7 +21,7 @@ class DGFuzzConfig:
     mutations_per_seed: int = 10
     mutation_strategies: List[str] = None
     max_strategy_combo: int = 3
-    confidence_threshold: float = 0.3
+    confidence_threshold: float = DEFECT_SIGMA
     cosine_distance_threshold: float = 0.05
     semantic_cosine_threshold: float = 0.1
     max_seed_pool_size: int = 5000
@@ -133,8 +134,7 @@ class DGFuzzFuzzer:
             pred_label, confidence = _pred_and_confidence(logits_np[0])
         feature = feat_np[0]
         is_misclass = pred_label != true_label
-        is_low_conf = confidence < self.config.confidence_threshold
-        if is_misclass or is_low_conf:
+        if is_misclass:
             defect = DefectPattern(sample=sample, true_label=true_label, pred_label=pred_label, confidence=confidence, feature=feature, parent_seed_id=id(parent_seed))
             return defect
         return None
@@ -332,23 +332,21 @@ def _run_dgfuzz_experiment_impl(config: Dict) -> Dict:
     model = model.to(device).eval()
     dataset_class = datasets.MNIST if dataset_name == 'mnist' else datasets.CIFAR10
     test_dataset = dataset_class(root='./data', train=False, download=True, transform=transforms.ToTensor())
-    from config import config as exp_config
-    exp_config.device = str(device)
+    from config import config as paths_config
+    from utils.cluster import hdbscan_params_for
+    from utils.runtime import dgfuzz_defaults_for_dataset
     adv_library_path = f'./results/{dataset_name}/{model_name}/adversarial_library.npz'
     if not os.path.exists(adv_library_path):
         raise FileNotFoundError(f'Adversarial library not found: {adv_library_path}')
     adv_library = dict(np.load(adv_library_path, allow_pickle=True))
-    hdbscan_defaults = {'mnist': {'lenet1': (20, 5), 'lenet4': (20, 5), 'lenet5': (20, 5)}, 'cifar10': {'resnet20': (20, 5), 'resnet50': (20, 5), 'resnet18': (20, 5), 'resnet34': (20, 5), 'densenet121': (20, 5), 'googlenet': (20, 5), 'mobilenet_v2': (20, 5), 'vgg13_bn': (20, 5), 'vgg16_bn': (20, 5)}}
-    if dataset_name in hdbscan_defaults and model_name in hdbscan_defaults[dataset_name]:
-        default_min_cluster_size, default_min_samples = hdbscan_defaults[dataset_name][model_name]
-        exp_config.hdbscan_min_cluster_size = default_min_cluster_size
-        exp_config.hdbscan_min_samples = default_min_samples
-    analyzer = ClusteringAnalyzer(model, exp_config)
+    hdbscan_mcs, hdbscan_ms = hdbscan_params_for(dataset_name, model_name)
+    analyzer = ClusteringAnalyzer(model, str(device), seed=paths_config.seed, hdbscan_min_cluster_size=hdbscan_mcs, hdbscan_min_samples=hdbscan_ms)
     features = analyzer.extract_features(adv_library['samples'])
     runtime_library_path = f'./results/{dataset_name}/{model_name}/adversarial_library_runtime.npz'
     np.savez(runtime_library_path, **adv_library, features=features)
     cluster_results = analyzer.perform_hdbscan_clustering_highdim(features)
-    mutation_engine = MutationEngine(exp_config)
+    mutation_engine = MutationEngine()
+    dg_defaults = dgfuzz_defaults_for_dataset(dataset_name)
 
     def _cfg(name: str, default):
         value = config.get(name, None)
@@ -368,7 +366,8 @@ def _run_dgfuzz_experiment_impl(config: Dict) -> Dict:
     for _k in ('max_samples', 'max_time_hours', 'early_stop_rounds', 'mutations_per_seed'):
         if config.get(_k) is not None:
             setattr(dgfuzz_config, _k, config[_k])
-    strategy = DGFuzzStrategy(model=model, mutation_engine=mutation_engine, device=device, config=dgfuzz_config, dataset=dataset_name, adv_library_path=runtime_library_path, analyzer=analyzer, cluster_labels=cluster_results['labels'], bandwidth=_cfg('dgfuzz_bandwidth', exp_config.dgfuzz_bandwidth_mnist if dataset_name == 'mnist' else exp_config.dgfuzz_bandwidth_cifar10), tau_r=_cfg('dgfuzz_tau_r', exp_config.dgfuzz_tau_r), top_b_ratio=_cfg('dgfuzz_top_b_ratio', exp_config.dgfuzz_top_b_ratio), psi1=_cfg('dgfuzz_psi1', exp_config.dgfuzz_psi1), psi2=_cfg('dgfuzz_psi2', exp_config.dgfuzz_psi2), cosine_threshold=_cfg('dgfuzz_cosine_threshold', exp_config.dgfuzz_cosine_threshold_mnist if dataset_name == 'mnist' else exp_config.dgfuzz_cosine_threshold_cifar10), enable_vrm=True, enable_seed_init=_cfg('enable_seed_init', True), enable_adaptive_schedule=_cfg('enable_adaptive_schedule', True))
+    dgfuzz_config.confidence_threshold = _cfg('dgfuzz_sigma', dg_defaults['sigma'])
+    strategy = DGFuzzStrategy(model=model, mutation_engine=mutation_engine, device=device, config=dgfuzz_config, dataset=dataset_name, adv_library_path=runtime_library_path, analyzer=analyzer, cluster_labels=cluster_results['labels'], bandwidth=_cfg('dgfuzz_bandwidth', dg_defaults['bandwidth']), tau_r=_cfg('dgfuzz_tau_r', dg_defaults['tau_r']), top_b_ratio=_cfg('dgfuzz_top_b_ratio', dg_defaults['top_b_ratio']), psi1=_cfg('dgfuzz_psi1', dg_defaults['psi1']), psi2=_cfg('dgfuzz_psi2', dg_defaults['psi2']), cosine_threshold=_cfg('dgfuzz_cosine_threshold', dg_defaults['cosine_threshold']), tau_h=_cfg('dgfuzz_tau_h', dg_defaults['tau_h']), enable_vrm=True, enable_seed_init=_cfg('enable_seed_init', True), enable_adaptive_schedule=_cfg('enable_adaptive_schedule', True))
     fuzzer = DGFuzzFuzzer(model=model, config=dgfuzz_config, analyzer=analyzer, mutation_engine=mutation_engine, device=device, strategy=strategy)
     n_seeds = strategy.initialize_seeds(seed_pool=fuzzer.seed_pool, test_dataset=test_dataset, extra_info={'dataset_name': dataset_name, 'model_name': model_name})
     if n_seeds == 0:
@@ -471,6 +470,8 @@ if __name__ == '__main__':
     parser.add_argument('--dgfuzz_psi1', type=float, default=None)
     parser.add_argument('--dgfuzz_psi2', type=float, default=None)
     parser.add_argument('--dgfuzz_cosine_threshold', type=float, default=None)
+    parser.add_argument('--dgfuzz_tau_h', type=float, default=None, help='Normalized entropy threshold for fallback exploration (region V)')
+    parser.add_argument('--dgfuzz_sigma', type=float, default=None, help='Minimum confidence on misclassified class (Def. 1)')
     parser.add_argument('--enable_seed_init', type=int, choices=[0, 1], default=1)
     parser.add_argument('--enable_adaptive_schedule', type=int, choices=[0, 1], default=1)
     parser.add_argument('--ablation_name', type=str, default=None, help='Ablation run name when a switch is off; saved under results/ablation/')
