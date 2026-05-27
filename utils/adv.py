@@ -7,13 +7,22 @@ import warnings
 import time
 warnings.filterwarnings('ignore')
 
+# VRM attack defaults (fixed in implementation).
+ATTACK_EPS = 0.03
+ATTACK_ALPHA = 0.01
+PGD_STEPS = 40
+FAB_STEPS = 20
+FAB_RESTARTS = 1
+MM_STEPS = 20
+FMN_STEPS = 20
+FMN_GAMMA = 0.05
+
 class AdversarialSampleGenerator:
 
-    def __init__(self, model, config, dataset_name):
-        self.model = model.to(config.device).eval()
-        self.config = config
+    def __init__(self, model, device: str, dataset_name: str):
+        self.device = device
+        self.model = model.to(device).eval()
         self.dataset_name = dataset_name
-        self.device = config.device
         is_mnist = dataset_name == 'mnist'
         self.batch_sizes = {'fab': 1024 if is_mnist else 128, 'pgd': 2048 if is_mnist else 256, 'mm': 2048 if is_mnist else 256, 'fmn': 2048 if is_mnist else 256}
         torch.backends.cudnn.benchmark = True
@@ -27,9 +36,7 @@ class AdversarialSampleGenerator:
             return logits.argmax(dim=1).detach().cpu().numpy()
 
     def _mm_attack(self, x, y):
-        eps = getattr(self.config, 'mm_eps', self.config.pgd_eps)
-        alpha = getattr(self.config, 'mm_alpha', self.config.pgd_alpha)
-        steps = getattr(self.config, 'mm_steps', max(5, self.config.pgd_steps // 2))
+        eps, alpha, steps = ATTACK_EPS, ATTACK_ALPHA, MM_STEPS
         x_orig = x.detach()
         x_adv = x_orig.clone().detach()
         x_adv = x_adv + (torch.rand_like(x_adv) * 2 - 1) * eps
@@ -50,10 +57,7 @@ class AdversarialSampleGenerator:
         return x_adv
 
     def _fmn_attack(self, x, y):
-        max_eps = getattr(self.config, 'fmn_eps', self.config.pgd_eps)
-        steps = getattr(self.config, 'fmn_steps', max(6, self.config.pgd_steps // 2))
-        alpha = getattr(self.config, 'fmn_alpha', self.config.pgd_alpha)
-        gamma = getattr(self.config, 'fmn_gamma', 0.05)
+        max_eps, steps, alpha, gamma = ATTACK_EPS, FMN_STEPS, ATTACK_ALPHA, FMN_GAMMA
         x_orig = x.detach()
         x_adv = x_orig.clone().detach()
         eps_t = torch.full((x.shape[0], 1, 1, 1), max_eps, device=x.device)
@@ -107,8 +111,8 @@ class AdversarialSampleGenerator:
         print(f'Loaded {len(all_samples)} samples\n')
         adv_library = {'samples': [], 'original_indices': [], 'attack_methods': [], 'original_labels': [], 'adv_labels': []}
         stats = {}
-        pgd_attack = PGD(self.model, eps=self.config.pgd_eps, alpha=self.config.pgd_alpha, steps=self.config.pgd_steps, random_start=True)
-        fab_attack = FAB(self.model, eps=getattr(self.config, 'fab_eps', self.config.pgd_eps), steps=getattr(self.config, 'fab_steps', max(10, self.config.pgd_steps // 2)), n_restarts=getattr(self.config, 'fab_restarts', 1))
+        pgd_attack = PGD(self.model, eps=ATTACK_EPS, alpha=ATTACK_ALPHA, steps=PGD_STEPS, random_start=True)
+        fab_attack = FAB(self.model, eps=ATTACK_EPS, steps=FAB_STEPS, n_restarts=FAB_RESTARTS)
         attacks = [('PGD', [('pgd', lambda x, y: pgd_attack(x, y))]), ('FAB', [('fab', lambda x, y: fab_attack(x, y))]), ('MM Attack', [('mm', self._mm_attack)]), ('FMN', [('fmn', self._fmn_attack)])]
         for phase, attack_info in enumerate(attacks, 1):
             phase_name, attack_list = (attack_info[0], attack_info[1])
