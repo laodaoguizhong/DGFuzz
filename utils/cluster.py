@@ -1,3 +1,4 @@
+from typing import Optional, Tuple
 import torch
 import numpy as np
 import matplotlib
@@ -10,12 +11,32 @@ import hdbscan
 import warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 
-class ClusteringAnalyzer:
+HDBSCAN_PER_MODEL = {
+    'mnist': {'lenet1': (20, 5), 'lenet4': (20, 5), 'lenet5': (20, 5)},
+    'cifar10': {
+        'resnet20': (20, 5), 'resnet50': (20, 5), 'resnet18': (20, 5), 'resnet34': (20, 5),
+        'densenet121': (20, 5), 'googlenet': (20, 5), 'mobilenet_v2': (20, 5),
+        'vgg13_bn': (20, 5), 'vgg16_bn': (20, 5),
+    },
+}
 
-    def __init__(self, model, config):
+
+def hdbscan_params_for(dataset: str, model: str) -> Tuple[int, int]:
+    return HDBSCAN_PER_MODEL.get(dataset, {}).get(model, (20, 5))
+
+
+class ClusteringAnalyzer:
+    UMAP_N_NEIGHBORS = 15
+    UMAP_MIN_DIST = 0.1
+    HDBSCAN_MIN_CLUSTER_SIZE = 20
+    HDBSCAN_MIN_SAMPLES = 5
+
+    def __init__(self, model, device: str, seed: int = 42, hdbscan_min_cluster_size: Optional[int] = None, hdbscan_min_samples: Optional[int] = None):
         self.model = model
-        self.config = config
-        self.device = config.device
+        self.device = device
+        self.seed = seed
+        self.hdbscan_min_cluster_size = hdbscan_min_cluster_size or self.HDBSCAN_MIN_CLUSTER_SIZE
+        self.hdbscan_min_samples = hdbscan_min_samples or self.HDBSCAN_MIN_SAMPLES
         self.model.eval()
 
     def extract_features(self, samples, batch_size=None):
@@ -115,15 +136,15 @@ class ClusteringAnalyzer:
         return self.model(x)
 
     def perform_umap_reduction(self, features, n_components=2):
-        reducer = umap.UMAP(n_neighbors=self.config.umap_n_neighbors, min_dist=self.config.umap_min_dist, n_components=n_components, random_state=self.config.seed, n_jobs=-1, verbose=False)
+        reducer = umap.UMAP(n_neighbors=self.UMAP_N_NEIGHBORS, min_dist=self.UMAP_MIN_DIST, n_components=n_components, random_state=self.seed, n_jobs=-1, verbose=False)
         features_2d = reducer.fit_transform(features)
         return features_2d
 
     def perform_hdbscan_clustering_highdim(self, features, min_cluster_size=None, min_samples=None):
         if min_cluster_size is None:
-            min_cluster_size = getattr(self.config, 'hdbscan_min_cluster_size', 50)
+            min_cluster_size = self.hdbscan_min_cluster_size
         if min_samples is None:
-            min_samples = getattr(self.config, 'hdbscan_min_samples', 10)
+            min_samples = self.hdbscan_min_samples
         clusterer = hdbscan.HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples, cluster_selection_epsilon=0.0, metric='euclidean')
         labels = clusterer.fit_predict(features)
         mask = labels != -1
