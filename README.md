@@ -4,8 +4,6 @@ Code for the paper:
 
 **DGFuzz: Defect-Guided Fuzzing for Adversarial Defect Detection in Deep Neural Networks**
 
-**Author:** Dekang Ma  
-**Affiliation:** Engineering University of PAP
 
 ## Install
 
