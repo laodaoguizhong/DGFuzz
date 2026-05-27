@@ -3,8 +3,7 @@ import torch
 import torch.nn as nn
 from abc import ABC, abstractmethod
 from typing import Dict, List, Tuple, Optional, Any
-from utils.runtime import build_runtime
-from config import config as global_config
+from utils.runtime import build_runtime, dgfuzz_defaults_for_dataset, DEFECT_SIGMA
 
 class FuzzerStrategy(ABC):
 
@@ -34,11 +33,10 @@ class FuzzerStrategy(ABC):
         return len(seed_pool)
 
 def create_runtime(dataset: str, adv_library_path: str, cluster_labels, cluster_centers=None, **kwargs):
-    is_mnist = dataset == 'mnist'
     kwargs.pop('train_dataloader', None)
     kwargs.pop('analyzer', None)
-    runtime = build_runtime(adv_library_path=adv_library_path, cluster_labels=cluster_labels, cluster_centers=cluster_centers, bandwidth=kwargs.pop('bandwidth', global_config.dgfuzz_bandwidth_mnist if is_mnist else global_config.dgfuzz_bandwidth_cifar10), tau_r=kwargs.pop('tau_r', global_config.dgfuzz_tau_r), top_b_ratio=kwargs.pop('top_b_ratio', global_config.dgfuzz_top_b_ratio), psi1=kwargs.pop('psi1', global_config.dgfuzz_psi1), psi2=kwargs.pop('psi2', global_config.dgfuzz_psi2), cosine_threshold=kwargs.pop('cosine_threshold', global_config.dgfuzz_cosine_threshold_mnist if is_mnist else global_config.dgfuzz_cosine_threshold_cifar10), enable_vrm=kwargs.pop('enable_vrm', True), enable_adaptive_schedule=kwargs.pop('enable_adaptive_schedule', True), **kwargs)
-    return runtime
+    defaults = dgfuzz_defaults_for_dataset(dataset)
+    return build_runtime(adv_library_path=adv_library_path, cluster_labels=cluster_labels, cluster_centers=cluster_centers, bandwidth=kwargs.pop('bandwidth', defaults['bandwidth']), tau_r=kwargs.pop('tau_r', defaults['tau_r']), top_b_ratio=kwargs.pop('top_b_ratio', defaults['top_b_ratio']), psi1=kwargs.pop('psi1', defaults['psi1']), psi2=kwargs.pop('psi2', defaults['psi2']), cosine_threshold=kwargs.pop('cosine_threshold', defaults['cosine_threshold']), tau_h=kwargs.pop('tau_h', defaults['tau_h']), enable_vrm=kwargs.pop('enable_vrm', True), enable_adaptive_schedule=kwargs.pop('enable_adaptive_schedule', True), **kwargs)
 
 class DGFuzzStrategy(FuzzerStrategy):
 
@@ -185,7 +183,8 @@ class DGFuzzStrategy(FuzzerStrategy):
         else:
             direct_features = np.empty((0, 0), dtype=np.float32)
         direct_added = self._runtime.append_direct_seeds(direct_seeds, direct_features)
-        print(f'[DGFuzz Seed Init] regular_kept={regular_kept}, direct_added={direct_added}, total_initialized={regular_kept + direct_added}')
+        qv = len(self._runtime._fallback_pool)
+        print(f'[DGFuzz Seed Init] regular_kept={regular_kept}, direct_added={direct_added}, Q_V={qv}, total_initialized={regular_kept + direct_added}')
         return regular_kept + direct_added
 
     def select_seed(self, seed_pool=None):
@@ -221,9 +220,10 @@ class DGFuzzStrategy(FuzzerStrategy):
             is_unique = bool(self._runtime.is_interesting(feature_vec, int(true_label), int(pred_label)))
         is_defect = False
         defect_info = None
-        if pred_label is not None and (int(pred_label) != int(true_label) or confidence < self.config.confidence_threshold):
+        sigma = getattr(self.config, 'confidence_threshold', DEFECT_SIGMA)
+        if pred_label is not None and int(pred_label) != int(true_label) and float(confidence) >= float(sigma):
             is_defect = True
-            defect_info = {'pred_label': int(pred_label), 'true_label': int(true_label), 'confidence': float(confidence), 'type': 'misclassification' if int(pred_label) != int(true_label) else 'low_confidence'}
+            defect_info = {'pred_label': int(pred_label), 'true_label': int(true_label), 'confidence': float(confidence), 'type': 'misclassification'}
         parent_seed = metadata.get('parent_seed')
         parent_generation = int(parent_seed.get('generation', 0)) if isinstance(parent_seed, dict) else 0
         parent_priority = float(parent_seed.get('priority', 1.0)) if isinstance(parent_seed, dict) else 1.0
